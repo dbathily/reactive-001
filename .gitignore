@@ -21,5 +21,6 @@ project/plugins/project/
 .project
 .idea*
 .cache
+atlassian-ide-plugin.xml
 
 .DS_Store
