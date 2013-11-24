@@ -3,35 +3,87 @@ package nodescala
 
 
 import scala.language.postfixOps
-import scala.util.{Try, Success, Failure}
+import scala.util.{Success, Failure}
 import scala.collection._
 import scala.concurrent._
 import ExecutionContext.Implicits.global
 import scala.concurrent.duration._
-import scala.async.Async.{async, await}
+import scala.async.Async.async
 import org.scalatest._
 import NodeScala._
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
+import scala._
+import java.util.concurrent.TimeoutException
+import scala.concurrent.TimeoutException
 
 @RunWith(classOf[JUnitRunner])
 class NodeScalaSuite extends FunSuite {
 
   test("A Future should always be created") {
-    val always = Future.always(517)
-
-    assert(Await.result(always, 0 nanos) == 517)
+    val v = 517
+    assert(Await.result(Future.always(v), 0 nanos) == v)
   }
 
   test("A Future should never be created") {
-    val never = Future.never[Int]
-
-    try {
-      Await.result(never, 1 second)
-      assert(false)
-    } catch {
-      case t: TimeoutException => // ok!
+    intercept[TimeoutException] {
+      Await.result(Future.never[Int], 1 second)
     }
+  }
+
+  test("All Futures should be completed") {
+    val range = (1 to 10).toList
+    val fs = Future.all(range.map(Future(_)))
+    assert(Await.result(fs, 1 second) == range)
+  }
+
+  test("Sequence of futures should fail if one future failed") {
+    intercept[Error] {
+      val fs = Future.all((1 to 10).+:(throw new Error()).map(Future(_)).toList)
+      Await.result(fs, 1 second)
+    }
+  }
+
+  test("Future delay") {
+    Await.result(Future.delay(1 second), 2 seconds)
+    intercept[TimeoutException] {
+      Await.result(Future.delay(2 seconds), 1 second)
+    }
+  }
+
+  test("Future now") {
+    assert(Future.always(1).now == 1)
+    intercept[UnsupportedOperationException] {
+      Future.failed(new UnsupportedOperationException).now
+    }
+    intercept[NoSuchElementException] {
+      (for(d <- Future.delay(1 minute); f <- Future.always(1)) yield f).now
+    }
+
+  }
+
+  test("Future continueWith") {
+    val f = Future {throw new Error} continueWith { f => true  }
+    assert(Await.result(f, 1 second))
+
+    intercept[UnsupportedOperationException] {
+      Await.result(Future.always(true) continueWith { f => throw new UnsupportedOperationException }, 1 second)
+    }
+  }
+
+  test("Future continue") {
+    val f = Future {throw new Error} continue { f => true  }
+    assert(Await.result(f, 1 second))
+
+    intercept[UnsupportedOperationException] {
+      Await.result(Future.always(true) continue { f => throw new UnsupportedOperationException }, 1 second)
+    }
+
+    assert(Await.result(Future.always(1) continue {
+      case Success(i) => i * 2
+      case Failure(t) => 0
+    }, 1 second) == 2)
+
   }
 
   test("CancellationTokenSource should allow stopping the computation") {
