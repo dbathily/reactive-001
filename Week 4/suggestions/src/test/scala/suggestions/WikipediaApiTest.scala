@@ -13,6 +13,9 @@ import gui._
 
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
+import rx.lang.scala.concurrency.Schedulers
+import java.util.NoSuchElementException
+import scala.NoSuchElementException
 
 
 @RunWith(classOf[JUnitRunner])
@@ -66,5 +69,18 @@ class WikipediaApiTest extends FunSuite {
       s => total = s
     }
     assert(total == (1 + 1 + 2 + 1 + 2 + 3), s"Sum: $total")
+  }
+
+  test("WikipediaApi recovered") {
+    val e = new NoSuchElementException
+    val stream = Observable(1, 2) ++ Observable(e) ++ Observable(4)
+    val recovered = stream.recovered.toBlockingObservable.toList
+    assert(recovered == List(Success(1), Success(2), Failure(e)), recovered)
+  }
+
+  test("WikipediaApi timeout") {
+    val stream = Observable(1, 2, 3).zip(Observable.interval(400 millis)).timedOut(1L)
+    val observed = stream.toBlockingObservable.toList
+    assert(observed == List((1,0),(2,1)), observed)
   }
 }

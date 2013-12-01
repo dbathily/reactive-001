@@ -2,14 +2,11 @@ package suggestions
 package gui
 
 import scala.language.reflectiveCalls
-import scala.collection.mutable.ListBuffer
-import scala.collection.JavaConverters._
-import scala.concurrent._
-import scala.concurrent.ExecutionContext.Implicits.global
-import scala.util.{ Try, Success, Failure }
 import scala.swing.Reactions.Reaction
 import scala.swing.event.Event
-import rx.lang.scala.Observable
+import rx.lang.scala.{Observer, Observable}
+import rx.lang.scala.subscriptions.Subscription
+import scala.swing.Reactions
 
 /** Basic facilities for dealing with Swing-like components.
 *
@@ -46,12 +43,25 @@ trait SwingApi {
 
   implicit class TextFieldOps(field: TextField) {
 
+
     /** Returns a stream of text field values entered in the given text field.
       *
       * @param field the text field
       * @return an observable with a stream of text field updates
       */
-    def textValues: Observable[String] = ???
+    def textValues: Observable[String] = Observable { observer:Observer[String] =>
+
+      val r: Reactions.Reaction = {
+        case(e: Event) => {
+          observer.onNext(field.text)
+        }
+      }
+
+      field.subscribe(r)
+
+      Subscription({field.unsubscribe(r)})
+
+    }
 
   }
 
@@ -62,7 +72,19 @@ trait SwingApi {
      * @param field the button
      * @return an observable with a stream of buttons that have been clicked
      */
-    def clicks: Observable[Button] = ???
+    def clicks: Observable[Button] = Observable { observer:Observer[Button] =>
+
+      val r: Reactions.Reaction = {
+        case(e: Event) => {
+          observer.onNext(button)
+        }
+      }
+
+      button.subscribe(r)
+
+      Subscription({button.unsubscribe(r)})
+
+    }
 
   }
 
