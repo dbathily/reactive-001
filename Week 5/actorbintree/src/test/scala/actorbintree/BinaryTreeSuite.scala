@@ -115,7 +115,7 @@ class BinaryTreeSuite(_system: ActorSystem) extends TestKit(_system) with FunSui
 
     val requester = TestProbe()
     val topNode = system.actorOf(Props[BinaryTreeSet])
-    val count = 1000
+    val count = 100000
 
     val ops = randomOperations(requester.ref, count)
     val expectedReplies = referenceReplies(ops)
