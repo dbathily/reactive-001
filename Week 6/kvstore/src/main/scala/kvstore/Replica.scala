@@ -49,55 +49,137 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   val persistence = context.actorOf(persistenceProps)
 
-  var waitingPersistence = Map.empty[Long, (ActorRef, Cancellable)]
+  var waitingPersistence = Map.empty[Long, (ActorRef, Persist, Cancellable)]
+  var waitingReplicates = Map.empty[Long, (ActorRef, Replicate, Set[(ActorRef, Cancellable)], Cancellable)]
 
   override def preStart(): Unit =
     arbiter ! Join
 
-  override def postStop(): Unit =
+  override def postStop(): Unit = {
     waitingPersistence foreach {
-      case (_, (_, cancellable)) =>
+      case (_, (_, _, cancellable)) =>
         cancellable.cancel()
     }
+    waitingReplicates foreach {
+      case (_, (_, _, waiting, timeout)) =>
+        timeout.cancel()
+        waiting foreach {
+          case (_, cancellable) =>
+            cancellable.cancel()
+        }
+    }
+  }
+
+
 
   def receive = {
     case JoinedPrimary   ⇒ context.become(leader)
     case JoinedSecondary ⇒ context.become(replica)
   }
 
-  def schedulePersist(key:String, valueOption:Option[String], id:Long):Cancellable =
+  def schedule(call: => Unit): Cancellable =
     system.scheduler.schedule(0.millis, 100.millis) {
-      persistence ! Persist(key, valueOption, id)
+      call
     }
 
-  def persist(key:String, valueOption:Option[String], id:Long):Unit = {
+  def timeout(onTimeout: => Unit): Cancellable =
+    system.scheduler.scheduleOnce(1.second)(onTimeout)
+
+  def schedulePersist(call: => Unit)(onTimeout: => Unit): Cancellable = {
+    val retry = schedule(call)
+    val t = timeout {
+      retry.cancel()
+      onTimeout
+    }
+
+    new Cancellable {
+      def isCancelled: Boolean = retry.isCancelled && t.isCancelled
+      def cancel(): Boolean = retry.cancel() && t.cancel()
+    }
+  }
+    
+
+  def persist(client:ActorRef, key:String, valueOption:Option[String], id:Long)
+             (onTimeout: Option[ActorRef => Unit] = None): Unit = {
+
     valueOption match {
       case Some(value) =>
         kv += (key -> value)
       case None =>
         kv -= key
     }
-    waitingPersistence += (id -> (sender, schedulePersist(key, valueOption, id)))
+
+    val p = Persist(key, valueOption, id)
+
+    waitingPersistence += (id -> (client, p, schedulePersist { persistence ! p } {
+      waitingPersistence -= id
+      onTimeout.map(_(client))
+    }))
+
   }
 
-  def persisted(key:String, id:Long, callback:ActorRef => Unit):Unit = {
-    waitingPersistence.get(id).map{ case (sender, cancellable) =>
-      waitingPersistence -= id
+  def persisted(key:String, id:Long, onPersisted:(ActorRef, Persist) => Unit): Unit = {
+    waitingPersistence.get(id).map { case (sender, p, cancellable) =>
       cancellable.cancel()
-      callback(sender)
+      waitingPersistence -= id
+      onPersisted(sender, p)
     }
+  }
+
+  def replicate(client:ActorRef, p:Persist): Unit = { secondaries.size > 0 match {
+    case true =>
+      val r = Replicate(p.key, p.valueOption, p.id)
+      waitingReplicates += (p.id -> (client, r, (secondaries map {
+        case (replicate, replicator) =>
+          (replicator, schedule {
+            replicator ! r
+          })
+      }).toSet, timeout(cancelReplication(client, p.id))))
+    case false =>
+      client ! OperationAck(p.id)
+
+  }}
+
+  def cancelReplication(client:ActorRef, id:Long): Unit = {
+    waitingReplicates.get(id).map {case (_, _, waiting, _) =>
+      waiting foreach { case (_, cancellable) =>
+        cancellable.cancel()
+      }
+    }
+    waitingReplicates -= id
+    client ! OperationFailed(id)
   }
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) =>
-      persist(key, Some(value), id)
+      persist(sender, key, Some(value), id)(Some(_ ! OperationFailed(id)))
     case Remove(key, id) =>
-      persist(key, None, id)
+      persist(sender, key, None, id)(Some(_ ! OperationFailed(id)))
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
     case Persisted(key, id) =>
-      persisted(key, id, _ ! OperationAck(id))
+      persisted(key, id, replicate)
+    case Replicated(key, id) =>
+      waitingReplicates.get(id).map { case (client, r, waiting, timeout) => {
+        waiting.find(_._1 == sender).map { e =>
+          e._2.cancel()
+          val updated = waiting - e
+          if(updated.size > 0)
+            waitingReplicates = waitingReplicates.updated(id, (client, r, updated, timeout))
+          else {
+            timeout.cancel()
+            waitingReplicates -= id
+            client ! OperationAck(id)
+          }
+        }
+      }}
+    case Replicas(replicas) =>
+      replicas filter { replica => replica != self && !secondaries.contains(replica) } map { replica =>
+        val replicator = context.actorOf(Replicator.props(replica))
+        secondaries += replica -> replicator
+        //TODO
+      }
   }
 
   /* TODO Behavior for the replica role. */
@@ -107,13 +189,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       if(seq < expected) {
         sender ! SnapshotAck(key, seq)
       }else if(seq == expected) {
-        persist(key, valueOption, seq)
+        persist(sender, key, valueOption, seq)()
         lastSeq = seq
       }
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
     case Persisted(key, id) =>
-      persisted(key, id, _ ! SnapshotAck(key, id))
+      persisted(key, id, (client, p) => client ! SnapshotAck(key, id))
   }
 
 }
