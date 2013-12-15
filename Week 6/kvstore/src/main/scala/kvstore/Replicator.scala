@@ -23,7 +23,7 @@ class Replicator(val replica: ActorRef) extends Actor {
    */
 
   // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
+  var acks = Map.empty[Long, (ActorRef, Replicate, Cancellable)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
   
@@ -34,25 +34,26 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
 
-  val cancellable:Cancellable = system.scheduler.schedule(0.millis, 100.millis) {
-    acks foreach {
-      case (seq, (primary, Replicate(key, valueOption, id))) => {
-        replica ! Snapshot(key, valueOption, seq)
-      }
+  def schedule(key:String, valueOption:Option[String], seq:Long):Cancellable =
+    system.scheduler.schedule(0.millis, 100.millis) {
+      replica ! Snapshot(key, valueOption, seq)
     }
-  }
 
   override def postStop(): Unit =
-    cancellable.cancel()
+    acks foreach {
+      case (_, (_, _, cancellable)) => {
+        cancellable.cancel()
+      }
+    }
 
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case Replicate(key, valueOption, id) =>
       val seq = nextSeq
-      acks += seq -> (sender, Replicate(key, valueOption, id))
-      replica ! Snapshot(key, valueOption, seq)
+      acks += seq -> (sender, Replicate(key, valueOption, id), schedule(key, valueOption, seq))
     case SnapshotAck(key, seq) => acks.get(seq) match {
-      case Some((primary, Replicate(key, _, id))) =>
+      case Some((primary, Replicate(key, _, id), cancellable)) =>
+        cancellable.cancel()
         acks -= seq
         primary ! Replicated(key, id)
       case None =>

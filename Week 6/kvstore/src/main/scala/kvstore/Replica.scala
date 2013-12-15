@@ -1,17 +1,14 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
+import akka.actor._
 import kvstore.Arbiter._
 import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
 import scala.annotation.tailrec
 import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
 import akka.util.Timeout
+import scala.Some
 
 object Replica {
   sealed trait Operation {
@@ -34,7 +31,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Replica._
   import Replicator._
   import Persistence._
-  import context.dispatcher
+  import context.{dispatcher, system}
 
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
@@ -50,24 +47,57 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var lastSeq = -1L
 
+  val persistence = context.actorOf(persistenceProps)
+
+  var waitingPersistence = Map.empty[Long, (ActorRef, Cancellable)]
+
   override def preStart(): Unit =
     arbiter ! Join
+
+  override def postStop(): Unit =
+    waitingPersistence foreach {
+      case (_, (_, cancellable)) =>
+        cancellable.cancel()
+    }
 
   def receive = {
     case JoinedPrimary   ⇒ context.become(leader)
     case JoinedSecondary ⇒ context.become(replica)
   }
 
+  def schedulePersist(key:String, valueOption:Option[String], id:Long):Cancellable =
+    system.scheduler.schedule(0.millis, 100.millis) {
+      persistence ! Persist(key, valueOption, id)
+    }
+
+  def persist(key:String, valueOption:Option[String], id:Long):Unit = {
+    valueOption match {
+      case Some(value) =>
+        kv += (key -> value)
+      case None =>
+        kv -= key
+    }
+    waitingPersistence += (id -> (sender, schedulePersist(key, valueOption, id)))
+  }
+
+  def persisted(key:String, id:Long, callback:ActorRef => Unit):Unit = {
+    waitingPersistence.get(id).map{ case (sender, cancellable) =>
+      waitingPersistence -= id
+      cancellable.cancel()
+      callback(sender)
+    }
+  }
+
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) =>
-      kv += (key -> value)
-      sender! OperationAck(id)
+      persist(key, Some(value), id)
     case Remove(key, id) =>
-      kv -= key
-      sender ! OperationAck(id)
+      persist(key, None, id)
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
+    case Persisted(key, id) =>
+      persisted(key, id, _ ! OperationAck(id))
   }
 
   /* TODO Behavior for the replica role. */
@@ -77,17 +107,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       if(seq < expected) {
         sender ! SnapshotAck(key, seq)
       }else if(seq == expected) {
-        valueOption match {
-          case Some(value) =>
-            kv += (key -> value)
-          case None =>
-            kv -= key
-        }
+        persist(key, valueOption, seq)
         lastSeq = seq
-        sender ! SnapshotAck(key, seq)
       }
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
+    case Persisted(key, id) =>
+      persisted(key, id, _ ! SnapshotAck(key, id))
   }
 
 }
