@@ -51,6 +51,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var waitingPersistence = Map.empty[Long, (ActorRef, Persist, Cancellable)]
   var waitingReplicates = Map.empty[Long, (ActorRef, Replicate, Set[(ActorRef, Cancellable)], Cancellable)]
+  var waitingInitialReplicates = Map.empty[Long, (Replicate, Set[(ActorRef, Cancellable)], Cancellable)]
 
   override def preStart(): Unit =
     arbiter ! Join
@@ -69,8 +70,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
     }
   }
-
-
 
   def receive = {
     case JoinedPrimary   ⇒ context.become(leader)
@@ -150,6 +149,53 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     client ! OperationFailed(id)
   }
 
+  def replicateToNewlyAdded(replicators:Set[ActorRef]): Unit = {
+    kv.zipWithIndex map { case ((key, value), i) =>
+      val r = Replicate(key, Some(value), i.toLong)
+      waitingInitialReplicates += (i.toLong -> (r, replicators map { replicator =>
+        (replicator, schedule(replicator ! r))
+      }, timeout(cancelInitialReplication(i))))
+    }
+  }
+
+  def cancelInitialReplication(id:Long): Unit = {
+    waitingInitialReplicates.get(id).map { case (_, waiting, _) =>
+      waiting foreach { case (_, cancellable) =>
+        cancellable.cancel()
+      }
+    }
+    waitingInitialReplicates -= id
+  }
+
+  def removeWaitingReplicate(replicator:ActorRef, client:ActorRef, r:Replicate,
+                             waiting:Set[(ActorRef, Cancellable)], timeout:Cancellable): Unit = {
+    waiting.find(_._1 == replicator).map { e =>
+      e._2.cancel()
+      val updated = waiting - e
+      if(updated.size > 0)
+        waitingReplicates = waitingReplicates.updated(r.id, (client, r, updated, timeout))
+      else {
+        timeout.cancel()
+        waitingReplicates -= r.id
+        client ! OperationAck(r.id)
+      }
+    }
+  }
+
+  def removeInitialWaitingReplicate(replicator:ActorRef, r:Replicate,
+                                    waiting:Set[(ActorRef, Cancellable)], timeout:Cancellable): Unit = {
+    waiting.find(_._1 == replicator).map { e =>
+      e._2.cancel()
+      val updated = waiting - e
+      if(updated.size > 0)
+        waitingInitialReplicates = waitingInitialReplicates.updated(r.id, (r, updated, timeout))
+      else {
+        timeout.cancel()
+        waitingInitialReplicates -= r.id
+      }
+    }
+  }
+
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) =>
@@ -161,25 +207,43 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Persisted(key, id) =>
       persisted(key, id, replicate)
     case Replicated(key, id) =>
-      waitingReplicates.get(id).map { case (client, r, waiting, timeout) => {
-        waiting.find(_._1 == sender).map { e =>
-          e._2.cancel()
-          val updated = waiting - e
-          if(updated.size > 0)
-            waitingReplicates = waitingReplicates.updated(id, (client, r, updated, timeout))
-          else {
-            timeout.cancel()
-            waitingReplicates -= id
-            client ! OperationAck(id)
-          }
-        }
-      }}
-    case Replicas(replicas) =>
-      replicas filter { replica => replica != self && !secondaries.contains(replica) } map { replica =>
-        val replicator = context.actorOf(Replicator.props(replica))
-        secondaries += replica -> replicator
-        //TODO
+      waitingReplicates.get(id).map { case (client, r, waiting, timeout) =>
+        removeWaitingReplicate(sender, client, r, waiting, timeout)
       }
+      waitingInitialReplicates.get(id).map { case (r, waiting, timeout) =>
+         removeInitialWaitingReplicate(sender, r, waiting, timeout)
+      }
+    case Replicas(replicas) =>
+
+      val (removed, alreadyAdded) = secondaries.partition {
+        case (replica, replicator) => !replicas.contains(replica)
+      }
+
+      removed foreach {
+        case (replica, replicator) =>
+          context.stop(replicator)
+          waitingReplicates foreach {
+            case (id, (client, r, waiting, timeout)) =>
+              removeWaitingReplicate(replicator, client, r, waiting, timeout)
+          }
+          waitingInitialReplicates foreach {
+            case (id, (r, waiting, timeout)) =>
+              removeInitialWaitingReplicate(replicator, r, waiting, timeout)
+          }
+          secondaries -= replica
+      }
+
+      val newReplicas = replicas filter {
+        replica => replica != self && !secondaries.contains(replica)
+      } map {
+        replica =>
+          val replicator = context.actorOf(Replicator.props(replica))
+          secondaries += replica -> replicator
+          replicator
+      }
+
+      replicateToNewlyAdded(newReplicas)
+
   }
 
   /* TODO Behavior for the replica role. */
