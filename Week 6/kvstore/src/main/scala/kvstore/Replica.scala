@@ -48,10 +48,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var lastSeq = -1L
 
   val persistence = context.actorOf(persistenceProps)
+  context.watch(persistence)
 
   var waitingPersistence = Map.empty[Long, (ActorRef, Persist, Cancellable)]
   var waitingReplicates = Map.empty[Long, (ActorRef, Replicate, Set[(ActorRef, Cancellable)], Cancellable)]
   var waitingInitialReplicates = Map.empty[Long, (Replicate, Set[(ActorRef, Cancellable)], Cancellable)]
+
+  override def supervisorStrategy: SupervisorStrategy = OneForOneStrategy(maxNrOfRetries = 3) {
+    case _: PersistenceException => Restart
+  }
 
   override def preStart(): Unit =
     arbiter ! Join
